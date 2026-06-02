@@ -1,8 +1,12 @@
 """
-DZ4P Campaign - Streamlit app for uploading contacts to Action Network.
+DZ4P Campaign - Daily Solidarity Tech Sync
 
-Accepts uploaded CSV/text files, parses them (with known-format detection or
-LLM fallback via Gemini), previews the data, and uploads to Action Network.
+Auto-pulls from Google Sheets, parses contacts, uploads new people to
+Solidarity Tech, and surfaces messages/comments for Dave to read.
+
+Usage:
+    pip install streamlit requests
+    streamlit run dz4p_solidarity_sync.py
 """
 
 import streamlit as st
@@ -14,9 +18,16 @@ import io
 import json
 
 # ── Config ────────────────────────────────────────────────────────────────
-BASE_URL = "https://actionnetwork.org/api/v2"
-FORM_ID = "ea2c4775-10d6-464b-bd48-ecd6a6161fbb"
+ST_BASE_URL = "https://api.solidarity.tech/v1"
+CHAPTER_ID = 2160
 DELAY = 0.3
+
+# Google Sheets CSV export URLs
+SHEET1_URL = "https://docs.google.com/spreadsheets/d/1RRcaInrEYke6mccW7sVYLFwFJfvjhNN0fRso-_BE4Mk/export?format=csv&gid=0"
+SHEET2_URL = "https://docs.google.com/spreadsheets/d/1tlPnpIn4fP_6BuDI9Cv9MXoJwXZRQTtrXo7cOZx2Hm4/export?format=csv&gid=0"
+
+# The compound tag with commas in its name
+COMPOUND_TAG = "Talk to Your Family, Friends, & Neighbors in Ward 4"
 
 KNOWN_TAGS = [
     "dz4p-website-signup",
@@ -29,7 +40,7 @@ KNOWN_TAGS = [
     "Host a Meet & Greet",
     "Host a Fundraiser",
     "Join the Campaign Team",
-    "Talk to Your Family, Friends, & Neighbors in Ward 4",
+    COMPOUND_TAG,
     "avail-mon-morning", "avail-mon-afternoon", "avail-mon-evening",
     "avail-tue-morning", "avail-tue-afternoon", "avail-tue-evening",
     "avail-wed-morning", "avail-wed-afternoon", "avail-wed-evening",
@@ -39,9 +50,9 @@ KNOWN_TAGS = [
     "avail-sun-morning", "avail-sun-afternoon", "avail-sun-evening",
 ]
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent"
+_PARSER_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
 
-LLM_SYSTEM = """You are a data parsing assistant for a political campaign.
+_PARSER_PROMPT = """You are a data parsing assistant for a political campaign.
 You will receive raw CSV or spreadsheet text from an unknown source.
 Your job is to extract contact records and return them as a JSON array.
 
@@ -49,216 +60,174 @@ Each record must have these fields:
   first    - first name (string, may be empty)
   last     - last name (string, may be empty)
   email    - email address (string, required - skip rows with no email)
+  phone    - phone number (string, may be empty)
   address  - full mailing address as a single string (string, may be empty)
   message  - any notes, comments, or freetext the person wrote (string, may be empty)
   tags     - list of strings. Always include "email-list-signup". Add any other tags
-             that make sense based on column names or values (e.g. checkbox columns,
-             event names, group memberships, availability slots like "avail-sat-morning").
-             If a cell contains comma-separated values that look like tag options, split them.
-             For columns named like "checkboxes_Something", if the value is 1 or true,
-             add "Something" as a tag.
+             that make sense based on column names or values.
 
 Return ONLY a valid JSON array with no explanation, no markdown, no code fences.
 If you cannot find any usable records, return an empty array [].
 """
 
 
+# ── Tag parsing (handles compound tag with commas) ────────────────────────
+
+def parse_checkbox_tags(raw):
+    """Parse comma-separated tags, preserving the compound tag name."""
+    if not raw or not raw.strip():
+        return []
+    tags = []
+    remaining = raw.strip()
+    if COMPOUND_TAG in remaining:
+        tags.append(COMPOUND_TAG)
+        remaining = remaining.replace(COMPOUND_TAG, "").strip().strip(",").strip()
+    compound_variant = COMPOUND_TAG.rstrip() + " "
+    if compound_variant in remaining:
+        if COMPOUND_TAG not in tags:
+            tags.append(COMPOUND_TAG)
+        remaining = remaining.replace(compound_variant, "").strip().strip(",").strip()
+    if remaining:
+        for t in remaining.split(","):
+            t = t.strip()
+            if t and t not in tags:
+                tags.append(t)
+    return tags
+
+
 # ── Parsing helpers ───────────────────────────────────────────────────────
-
-def parse_address(raw):
-    if not raw:
-        return None
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) < 3:
-        return {"address_lines": [raw], "country": "US"}
-    addr = {"country": "US", "address_lines": [parts[0]]}
-    if parts[-1].strip().lower() in ("united states", "us", "usa"):
-        parts = parts[:-1]
-    state_zip = re.compile(r'^([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$')
-    zip_only = re.compile(r'^(\d{5}(?:-\d{4})?)$')
-    state_only = re.compile(r'^([A-Za-z]{2})$')
-    state_map = {"michigan": "MI", "georgia": "GA", "ohio": "OH", "california": "CA"}
-    if len(parts) >= 2:
-        addr["locality"] = parts[1].strip()
-    for part in parts[2:]:
-        part = part.strip()
-        m = state_zip.match(part)
-        if m:
-            addr["region"] = m.group(1).upper()
-            addr["postal_code"] = m.group(2)
-            continue
-        m = zip_only.match(part)
-        if m:
-            addr["postal_code"] = m.group(1)
-            continue
-        m = state_only.match(part)
-        if m:
-            addr["region"] = m.group(1).upper()
-            continue
-        if part.lower() in state_map:
-            addr["region"] = state_map[part.lower()]
-    return addr
-
-
-def parse_address_from_columns(row):
-    """Build an address dict from individual columns (Address, City, State, Zip)."""
-    parts = {}
-    address_line = (row.get("Address") or "").strip()
-    city = (row.get("City") or "").strip()
-    state = (row.get("State/Province Abbreviated") or row.get("State/Province") or "").strip()
-    zipcode = (row.get("Zip code") or row.get("Zip") or "").strip()
-    country = (row.get("Country") or "US").strip()
-
-    if not any([address_line, city, state, zipcode]):
-        return None
-
-    addr = {"country": country or "US"}
-    if address_line:
-        addr["address_lines"] = [address_line]
-    if city:
-        addr["locality"] = city
-    if state:
-        addr["region"] = state[:2].upper() if len(state) > 2 else state.upper()
-    if zipcode:
-        addr["postal_code"] = str(zipcode)
-    return addr
-
 
 def split_name(full):
     parts = full.strip().split(None, 1)
     return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], "")
 
 
-# ── Known-format parser: fundraiser check-in CSV ─────────────────────────
+def clean_phone(val):
+    if not val or not val.strip():
+        return ""
+    digits = re.sub(r"\D", "", str(val))
+    if len(digits) == 11 and digits[0] == "1":
+        digits = digits[1:]
+    return digits if len(digits) == 10 else str(val).strip()
 
-def detect_fundraiser_checkin(headers):
-    """Detect the fundraiser check-in CSV format by column names."""
-    lower = [h.lower() for h in headers]
-    return "first name" in lower and "email" in lower and any("checkboxes_" in h.lower() for h in headers)
+
+# ── Sheet fetching ────────────────────────────────────────────────────────
+
+def fetch_csv(url):
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        return None
 
 
-def parse_fundraiser_checkin(csv_text):
-    """Parse the fundraiser check-in CSV format with checkboxes_ columns."""
-    people = []
+# ── Known-format parsers ─────────────────────────────────────────────────
+
+def detect_and_parse(csv_text):
+    """Auto-detect format and parse."""
     reader = csv.DictReader(io.StringIO(csv_text))
-    for row in reader:
-        email = (row.get("Email") or "").strip()
-        if not email:
-            continue
+    try:
+        headers = reader.fieldnames or []
+    except:
+        return [], "empty"
 
-        first = (row.get("First name") or "").strip()
-        last = (row.get("Last name") or "").strip()
-        textarea = (row.get("textarea") or "").strip()
+    lower_headers = [h.lower() for h in headers]
 
-        # Build address from columns
-        addr_parts = []
-        for col in ["Address", "City", "State/Province Abbreviated", "Zip code"]:
-            val = (row.get(col) or "").strip()
-            if val:
-                addr_parts.append(val)
-        address_str = ", ".join(addr_parts)
+    if "message optional" in lower_headers:
+        return parse_website_signup1(csv_text), "website-signup-1"
 
-        # Extract tags from checkboxes_ columns
-        tags = ["email-list-signup"]
-        for key, val in row.items():
-            if key.startswith("checkboxes_") and val and val.strip() in ("1", "true", "True"):
-                tag_name = key[len("checkboxes_"):]
-                if tag_name not in tags:
-                    tags.append(tag_name)
+    if "address optional" in lower_headers:
+        return parse_website_signup2(csv_text), "website-signup-2"
 
-        people.append({
-            "first": first,
-            "last": last,
-            "email": email,
-            "address": address_str,
-            "message": textarea,
-            "tags": tags,
-        })
-    return people
+    if "first name" in lower_headers and any("checkboxes_" in h for h in headers):
+        return parse_fundraiser_checkin(csv_text), "fundraiser-checkin"
 
-
-# ── Known-format parser: website signup sheets ────────────────────────────
-
-def detect_website_signup1(headers):
-    lower = [h.lower() for h in headers]
-    return "name" in lower and "email" in lower and "address" in lower and "message optional" in lower
+    return [], "unknown"
 
 
 def parse_website_signup1(csv_text):
     people = []
     reader = csv.DictReader(io.StringIO(csv_text))
     for row in reader:
-        name = (row.get("Name") or "").strip()
         email = (row.get("Email") or "").strip()
         if not email:
             continue
+        name = (row.get("Name") or "").strip()
         first, last = split_name(name) if name else ("", "")
         address = (row.get("Address") or "").strip()
         message = (row.get("Message optional") or "").strip()
+        phone = clean_phone(row.get("phone", ""))
         checkbox_col = next((k for k in row if "check the boxes" in k.lower()), None)
-        extra_tags = [t.strip() for t in (row.get(checkbox_col, "") or "").split(",") if t.strip()] if checkbox_col else []
+        extra_tags = parse_checkbox_tags(row.get(checkbox_col, "")) if checkbox_col else []
         tags = list(dict.fromkeys(["dz4p-website-signup", "email-list-signup"] + extra_tags))
         people.append({"first": first, "last": last, "email": email,
-                        "address": address, "message": message, "tags": tags})
+                        "address": address, "message": message, "phone": phone, "tags": tags})
     return people
-
-
-def detect_website_signup2(headers):
-    lower = [h.lower() for h in headers]
-    return "name" in lower and "email" in lower and "message" in lower and "address optional" in lower
 
 
 def parse_website_signup2(csv_text):
     people = []
     reader = csv.DictReader(io.StringIO(csv_text))
     for row in reader:
-        name = (row.get("Name") or "").strip()
         email = (row.get("Email") or "").strip()
         if not email:
             continue
+        name = (row.get("Name") or "").strip()
         first, last = split_name(name) if name else ("", "")
         address = (row.get("Address optional") or row.get("Address") or "").strip()
         message = (row.get("Message") or "").strip()
+        phone = clean_phone(row.get("phone", ""))
         checkbox_col = next((k for k in row if "check the boxes" in k.lower()), None)
-        extra_tags = [t.strip() for t in (row.get(checkbox_col, "") or "").split(",") if t.strip()] if checkbox_col else []
+        extra_tags = parse_checkbox_tags(row.get(checkbox_col, "")) if checkbox_col else []
         tags = list(dict.fromkeys(["dz4p-website-signup", "email-list-signup"] + extra_tags))
         people.append({"first": first, "last": last, "email": email,
-                        "address": address, "message": message, "tags": tags})
+                        "address": address, "message": message, "phone": phone, "tags": tags})
     return people
 
 
-# ── LLM parser (Gemini) ──────────────────────────────────────────────────
+def parse_fundraiser_checkin(csv_text):
+    people = []
+    reader = csv.DictReader(io.StringIO(csv_text))
+    for row in reader:
+        email = (row.get("Email") or "").strip()
+        if not email:
+            continue
+        first = (row.get("First name") or "").strip()
+        last = (row.get("Last name") or "").strip()
+        textarea = (row.get("textarea") or "").strip()
+        addr_parts = []
+        for col in ["Address", "City", "State/Province Abbreviated", "Zip code"]:
+            val = (row.get(col) or "").strip()
+            if val:
+                addr_parts.append(val)
+        address_str = ", ".join(addr_parts)
+        phone = clean_phone(row.get("Phone", "") or row.get("phone", ""))
+        tags = ["email-list-signup"]
+        for key, val in row.items():
+            if key.startswith("checkboxes_") and val and val.strip() in ("1", "true", "True"):
+                tag_name = key[len("checkboxes_"):]
+                if tag_name not in tags:
+                    tags.append(tag_name)
+        people.append({"first": first, "last": last, "email": email,
+                        "address": address_str, "message": textarea, "phone": phone, "tags": tags})
+    return people
 
-def parse_with_llm(raw_text, gemini_key):
+
+# ── Fallback parser for unknown CSV formats ──────────────────────────────
+
+def parse_unknown(raw_text, parser_key):
     payload = {
-        "contents": [{
-            "parts": [{"text": LLM_SYSTEM}, {"text": raw_text[:12000]}]
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 4000,
-        },
+        "contents": [{"parts": [{"text": _PARSER_PROMPT}, {"text": raw_text[:12000]}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000},
     }
     try:
-        r = requests.post(
-            f"{GEMINI_URL}?key={gemini_key}",
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=60,
-        )
+        r = requests.post(f"{_PARSER_URL}?key={parser_key}",
+                          headers={"Content-Type": "application/json"},
+                          json=payload, timeout=60)
         if r.status_code != 200:
-            return [], f"Gemini API error: {r.status_code} - {r.text[:200]}"
-
+            return [], f"Parser error: {r.status_code}"
         result = r.json()
-        usage = result.get("usageMetadata", {})
-
-        try:
-            finish_reason = result["candidates"][0].get("finishReason")
-            if finish_reason == "MAX_TOKENS":
-                return [], "Gemini response truncated (MAX_TOKENS)"
-        except (KeyError, IndexError):
-            pass
-
         parts = result["candidates"][0]["content"]["parts"]
         text = None
         for p in reversed(parts):
@@ -266,236 +235,202 @@ def parse_with_llm(raw_text, gemini_key):
                 text = p["text"]
                 break
         if not text:
-            return [], "No text in Gemini response"
-
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-
-        people = json.loads(text.strip())
+            return [], "No results from parser"
+        text = text.strip().strip("`").removeprefix("json").strip()
+        people = json.loads(text)
         for p in people:
             if "email-list-signup" not in p.get("tags", []):
                 p.setdefault("tags", []).insert(0, "email-list-signup")
-
-        token_info = (f"Tokens -- prompt:{usage.get('promptTokenCount', 0)} "
-                      f"output:{usage.get('candidatesTokenCount', 0)} "
-                      f"total:{usage.get('totalTokenCount', 0)}")
-        return people, token_info
-
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        return [], f"Error parsing Gemini response: {e}"
+        return people, f"Parsed {len(people)} records"
     except Exception as e:
-        return [], f"Error calling Gemini: {e}"
+        return [], f"Parser error: {e}"
 
 
-# ── Auto-detect and parse ────────────────────────────────────────────────
+# ── Solidarity Tech API ──────────────────────────────────────────────────
 
-def parse_file(csv_text, gemini_key=None):
-    """Try known parsers first, fall back to LLM."""
-    reader = csv.reader(io.StringIO(csv_text))
-    try:
-        headers = next(reader)
-    except StopIteration:
-        return [], "Empty file", "empty"
-
-    if detect_fundraiser_checkin(headers):
-        people = parse_fundraiser_checkin(csv_text)
-        return people, f"Detected fundraiser check-in format. Found {len(people)} records.", "fundraiser-checkin"
-
-    if detect_website_signup1(headers):
-        people = parse_website_signup1(csv_text)
-        return people, f"Detected Website Signup 1 format. Found {len(people)} records.", "website-signup-1"
-
-    if detect_website_signup2(headers):
-        people = parse_website_signup2(csv_text)
-        return people, f"Detected Website Signup 2 format. Found {len(people)} records.", "website-signup-2"
-
-    # Unknown format -- use LLM
-    if not gemini_key:
-        return [], "Unknown CSV format and no Gemini API key provided for LLM parsing.", "unknown"
-
-    people, info = parse_with_llm(csv_text, gemini_key)
-    return people, f"LLM parsed {len(people)} records. {info}", "llm"
+def st_headers(api_key):
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
 
-# ── Action Network helpers ────────────────────────────────────────────────
-
-def an_headers(api_key):
-    return {"Content-Type": "application/json", "OSDI-API-Token": api_key}
-
-
-def ensure_tags(api_key, extra_tags, progress_callback=None):
-    headers = an_headers(api_key)
-    tags_to_create = list(KNOWN_TAGS)
-    for t in extra_tags:
-        if t not in tags_to_create:
-            tags_to_create.append(t)
-
-    results = []
-    for i, tag in enumerate(tags_to_create):
-        resp = requests.post(f"{BASE_URL}/tags", headers=headers, json={"name": tag})
-        ok = resp.status_code in (200, 201)
-        results.append((tag, ok, resp.status_code))
-        if progress_callback:
-            progress_callback((i + 1) / len(tags_to_create))
-        time.sleep(DELAY)
-    return results
-
-
-def upload_person(api_key, person):
+def upload_person_st(api_key, person):
     if not person.get("email"):
         return None, "no email"
-    person_data = {
-        "given_name": person["first"],
-        "family_name": person["last"],
-        "email_addresses": [{"address": person["email"]}],
+
+    user_data = {
+        "first_name": person["first"],
+        "last_name": person["last"],
+        "email": person["email"],
+        "tags": person.get("tags", ["email-list-signup"]),
+        "chapter_id": CHAPTER_ID,
     }
 
-    # Handle address -- either from string or structured
-    addr = parse_address(person.get("address", ""))
-    if addr:
-        person_data["postal_addresses"] = [addr]
+    if person.get("address"):
+        user_data["address"] = person["address"]
+    if person.get("phone"):
+        user_data["phone_number"] = person["phone"]
 
-    if person.get("message"):
-        person_data["custom_fields"] = {"signup_message": person["message"]}
-
-    payload = {
-        "person": person_data,
-        "add_tags": person.get("tags", ["email-list-signup"]),
-    }
-    resp = requests.post(
-        f"{BASE_URL}/forms/{FORM_ID}/submissions",
-        headers=an_headers(api_key),
-        json=payload,
-    )
-    return resp.status_code, resp.text[:200]
+    payload = {"user": user_data}
+    resp = requests.post(f"{ST_BASE_URL}/users",
+                         headers=st_headers(api_key), json=payload)
+    return resp.status_code, resp.text[:300]
 
 
-# ── Streamlit app ─────────────────────────────────────────────────────────
+# ── Streamlit App ─────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="DZ4P Action Network Uploader", layout="wide")
-    st.title("DZ4P -- Action Network Uploader")
+    st.set_page_config(page_title="DZ4P Daily Sync", layout="wide")
+    st.title("DZ4P — Solidarity Tech Sync")
+    st.caption("Pull website signups, upload to Solidarity Tech, review messages")
 
-    # Sidebar: API keys
+    # Sidebar
     st.sidebar.header("API Keys")
-    an_key = st.sidebar.text_input("Action Network API Key", type="password",
-                                    help="Your Action Network API key")
-    gemini_key = st.sidebar.text_input("Gemini API Key", type="password",
-                                        help="Required only for unknown CSV formats")
+    st_key = st.sidebar.text_input("Solidarity Tech API Key", type="password")
+    parser_key = st.sidebar.text_input("Parser Key (for unknown CSVs)", type="password")
 
     st.sidebar.markdown("---")
-    st.sidebar.header("Additional Tags")
-    extra_tags_input = st.sidebar.text_area(
-        "Extra tags to add to all records (one per line)",
-        help="These tags will be added to every uploaded person, in addition to file-detected tags."
-    )
-    extra_global_tags = [t.strip() for t in extra_tags_input.strip().split("\n") if t.strip()]
+    st.sidebar.header("Settings")
+    auto_fetch = st.sidebar.checkbox("Auto-fetch Google Sheets", value=True)
 
-    # File upload
-    st.header("1. Upload File")
-    uploaded_file = st.file_uploader(
-        "Upload a CSV file with contact data",
-        type=["csv", "txt", "tsv"],
-        help="Supported formats: fundraiser check-in CSVs, website signup sheets, or any CSV (parsed via LLM)."
-    )
+    # ── Step 1: Fetch data ────────────────────────────────────────────────
+    st.header("1. Pull Contacts")
 
-    if uploaded_file is None:
-        st.info("Upload a CSV file to get started.")
+    all_people = []
+
+    if auto_fetch:
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Fetch Google Sheets", type="primary", use_container_width=True):
+                with st.spinner("Fetching Website_Signup1..."):
+                    csv1 = fetch_csv(SHEET1_URL)
+                if csv1:
+                    p1, fmt1 = detect_and_parse(csv1)
+                    st.success(f"Sheet 1: {len(p1)} records")
+                    all_people.extend(p1)
+                else:
+                    st.error("Could not fetch Sheet 1")
+
+                with st.spinner("Fetching Website_Signup2..."):
+                    csv2 = fetch_csv(SHEET2_URL)
+                if csv2:
+                    p2, fmt2 = detect_and_parse(csv2)
+                    st.success(f"Sheet 2: {len(p2)} records")
+                    all_people.extend(p2)
+                else:
+                    st.error("Could not fetch Sheet 2")
+
+                st.session_state["all_people"] = all_people
+
+        with col2:
+            uploaded_file = st.file_uploader("Or upload a CSV", type=["csv", "txt", "tsv"])
+            if uploaded_file:
+                raw = uploaded_file.read().decode("utf-8-sig")
+                people, fmt = detect_and_parse(raw)
+                if not people and parser_key:
+                    people, info = parse_unknown(raw, parser_key)
+                    st.info(info)
+                if people:
+                    st.success(f"File: {len(people)} records")
+                    prev = st.session_state.get("all_people", [])
+                    st.session_state["all_people"] = prev + people
+                else:
+                    st.warning("No records found in file")
+
+    # Get people from session
+    all_people = st.session_state.get("all_people", [])
+
+    if not all_people:
+        st.info("Click 'Fetch Google Sheets' to pull the latest signups.")
         return
 
-    # Read and parse
-    raw_text = uploaded_file.read().decode("utf-8-sig")
-    st.text(f"File: {uploaded_file.name} ({len(raw_text):,} bytes)")
-
-    people, parse_msg, fmt = parse_file(raw_text, gemini_key)
-    st.header("2. Parse Results")
-    st.write(parse_msg)
-
-    if not people:
-        st.warning("No records found. Check the file format or provide a Gemini API key for LLM parsing.")
-        return
-
-    # Add global extra tags
-    if extra_global_tags:
-        for p in people:
-            for t in extra_global_tags:
-                if t not in p.get("tags", []):
-                    p.setdefault("tags", []).append(t)
-
-    # Preview table
-    st.header("3. Preview")
-    preview_data = []
-    for p in people:
-        preview_data.append({
-            "First": p["first"],
-            "Last": p["last"],
-            "Email": p["email"],
-            "Address": p.get("address", "")[:50],
-            "Message": (p.get("message") or "")[:50],
-            "Tags": ", ".join(p.get("tags", [])),
-        })
-    st.dataframe(preview_data, use_container_width=True, height=400)
-    st.write(f"**{len(people)} records** ready to upload.")
-
-    # Upload
-    st.header("4. Upload to Action Network")
-    if not an_key:
-        st.warning("Enter your Action Network API key in the sidebar to upload.")
-        return
-
-    if st.button("Upload to Action Network", type="primary"):
-        # Collect all tags
-        all_tags_seen = set()
-        for p in people:
-            all_tags_seen.update(p.get("tags", []))
-
-        # Step 1: Ensure tags
-        st.subheader("Ensuring tags...")
-        tag_progress = st.progress(0)
-        tag_results = ensure_tags(an_key, list(all_tags_seen), progress_callback=tag_progress.progress)
-        tag_errors = [r for r in tag_results if not r[1]]
-        if tag_errors:
-            st.warning(f"{len(tag_errors)} tag(s) had errors: {', '.join(r[0] for r in tag_errors)}")
+    # ── Dedupe ────────────────────────────────────────────────────────────
+    seen = {}
+    deduped = []
+    for p in all_people:
+        email = p.get("email", "").lower().strip()
+        if not email:
+            continue
+        if email in seen:
+            existing = seen[email]
+            for tag in p.get("tags", []):
+                if tag not in existing.get("tags", []):
+                    existing["tags"].append(tag)
+            if not existing.get("address") and p.get("address"):
+                existing["address"] = p["address"]
+            if not existing.get("phone") and p.get("phone"):
+                existing["phone"] = p["phone"]
+            if not existing.get("message") and p.get("message"):
+                existing["message"] = p["message"]
         else:
-            st.success(f"All {len(tag_results)} tags OK.")
+            seen[email] = p
+            deduped.append(p)
 
-        # Step 2: Upload people
-        st.subheader("Uploading people...")
-        progress_bar = st.progress(0)
-        status_area = st.empty()
+    # ── Step 2: Messages for Dave ─────────────────────────────────────────
+    messages = [p for p in deduped if p.get("message") and p["message"].strip()]
+
+    if messages:
+        st.header(f"2. Messages for Dave ({len(messages)})")
+        st.caption("These people left a note when they signed up:")
+        for p in messages:
+            with st.expander(f"{p['first']} {p['last']} -- {p['email']}" +
+                             (f" -- {p.get('phone', '')}" if p.get('phone') else "")):
+                st.markdown(f"> {p['message']}")
+                if p.get("address"):
+                    st.caption(p['address'])
+                if p.get("tags"):
+                    st.caption(', '.join(p['tags']))
+    else:
+        st.header("2. Messages for Dave")
+        st.info("No messages this batch.")
+
+    # ── Step 3: Preview ──────────────────────────────────────────────────
+    st.header(f"3. Preview ({len(deduped)} contacts)")
+    preview = []
+    for p in deduped:
+        preview.append({
+            "Name": f"{p['first']} {p['last']}",
+            "Email": p["email"],
+            "Phone": p.get("phone", ""),
+            "Address": (p.get("address") or "")[:50],
+            "Tags": ", ".join(p.get("tags", [])),
+            "Has Message": ("yes" if p.get("message") else ""),
+        })
+    st.dataframe(preview, use_container_width=True, height=400)
+
+    # ── Step 4: Upload ───────────────────────────────────────────────────
+    st.header("4. Upload to Solidarity Tech")
+
+    if not st_key:
+        st.warning("Enter your Solidarity Tech API key in the sidebar.")
+        return
+
+    if st.button("Upload to Solidarity Tech", type="primary"):
+        uploadable = [p for p in deduped if p.get("email")]
+        progress = st.progress(0)
+        status = st.empty()
         log_lines = []
-
-        success = 0
-        errors = 0
-        uploadable = [p for p in people if p.get("email")]
+        success = errors = 0
 
         for i, person in enumerate(uploadable):
             label = f"{person['first']} {person['last']} <{person['email']}>"
             try:
-                status_code, body = upload_person(an_key, person)
-                if status_code in (200, 201):
+                code, body = upload_person_st(st_key, person)
+                if code in (200, 201):
                     success += 1
                     log_lines.append(f"OK  [{i+1}/{len(uploadable)}] {label}")
                 else:
                     errors += 1
-                    log_lines.append(f"ERR [{i+1}/{len(uploadable)}] {label} -- HTTP {status_code}: {body[:80]}")
+                    log_lines.append(f"ERR [{i+1}/{len(uploadable)}] {label} -- HTTP {code}: {body[:100]}")
             except Exception as e:
                 errors += 1
                 log_lines.append(f"ERR [{i+1}/{len(uploadable)}] {label} -- {e}")
 
-            progress_bar.progress((i + 1) / len(uploadable))
-            status_area.text(f"Uploaded {i+1}/{len(uploadable)} -- {success} OK, {errors} errors")
+            progress.progress((i + 1) / len(uploadable))
+            status.text(f"Uploaded {i+1}/{len(uploadable)} -- {success} OK, {errors} errors")
             time.sleep(DELAY)
 
-        # Final summary
         st.markdown("---")
         if errors == 0:
-            st.success(f"Done. {success} people uploaded successfully.")
+            st.success(f"Done. {success} people uploaded.")
         else:
             st.warning(f"Done. {success} uploaded, {errors} errors.")
 
