@@ -125,15 +125,16 @@ def upload_person(api_key, person):
         user_data["address"] = person["address"]
     phone_raw = (person.get("phone") or "").strip()
     digits = re.sub(r"\D", "", phone_raw)
+    has_phone = False
     if len(digits) == 10:
         user_data["phone_number"] = "1" + digits
+        has_phone = True
     elif len(digits) == 11 and digits[0] == "1":
         user_data["phone_number"] = digits
-    # else: omit phone_number entirely
-    payload = {
-        "user": user_data,
-        "chapter_id": CHAPTER_ID,
-    }
+        has_phone = True
+    payload = {"user": user_data, "chapter_id": CHAPTER_ID}
+    if not has_phone:
+        payload["require_contact_info"] = False
     resp = requests.post(f"{ST_BASE_URL}/users",
                          headers={"Content-Type": "application/json",
                                   "Authorization": f"Bearer {api_key}"},
