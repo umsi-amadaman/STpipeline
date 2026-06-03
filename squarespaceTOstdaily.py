@@ -57,7 +57,7 @@ def clean_phone(val):
     digits = re.sub(r"\D", "", str(val))
     if len(digits) == 11 and digits[0] == "1":
         digits = digits[1:]
-    return digits if len(digits) == 10 else str(val).strip()
+    return digits if len(digits) == 10 else ""
 
 
 def fetch_csv(url):
@@ -124,7 +124,12 @@ def upload_person(api_key, person):
     if person.get("address"):
         user_data["address"] = person["address"]
     phone_raw = (person.get("phone") or "").strip()
-    user_data["phone_number"] = phone_raw if phone_raw else None
+    digits = re.sub(r"\D", "", phone_raw)
+    if len(digits) == 10:
+        user_data["phone_number"] = "1" + digits
+    elif len(digits) == 11 and digits[0] == "1":
+        user_data["phone_number"] = digits
+    # else: omit phone_number entirely
     payload = {
         "user": user_data,
         "chapter_id": CHAPTER_ID,
