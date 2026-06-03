@@ -12,6 +12,7 @@ import time
 import re
 import csv
 import io
+import json
 from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -123,16 +124,7 @@ def upload_person(api_key, person):
     if person.get("address"):
         user_data["address"] = person["address"]
     phone_raw = (person.get("phone") or "").strip()
-    if phone_raw:
-        digits = re.sub(r"\D", "", phone_raw)
-        if len(digits) == 10:
-            user_data["phone_number"] = "+1" + digits
-        elif len(digits) == 11 and digits[0] == "1":
-            user_data["phone_number"] = "+" + digits
-        else:
-            user_data["phone_number"] = None
-    else:
-        user_data["phone_number"] = None
+    user_data["phone_number"] = phone_raw if phone_raw else None
     payload = {
         "user": user_data,
         "chapter_id": CHAPTER_ID,
@@ -141,7 +133,7 @@ def upload_person(api_key, person):
                          headers={"Content-Type": "application/json",
                                   "Authorization": f"Bearer {api_key}"},
                          json=payload)
-    return resp.status_code, resp.text[:300]
+    return resp.status_code, resp.text, payload
 
 
 # ── App ───────────────────────────────────────────────────────────────────
@@ -198,13 +190,15 @@ def main():
         for i, person in enumerate(people):
             label = f"{person['first']} {person['last']} <{person['email']}>"
             try:
-                code, body = upload_person(st_key, person)
+                code, body, payload = upload_person(st_key, person)
                 if code in (200, 201):
                     success += 1
                     log_lines.append(f"OK  [{i+1}/{len(people)}] {label}")
                 else:
                     errors += 1
-                    log_lines.append(f"ERR [{i+1}/{len(people)}] {label} -- HTTP {code}: {body[:100]}")
+                    log_lines.append(f"ERR [{i+1}/{len(people)}] {label}")
+                    log_lines.append(f"    SENT: {json.dumps(payload)}")
+                    log_lines.append(f"    RESP: {body}")
             except Exception as e:
                 errors += 1
                 log_lines.append(f"ERR [{i+1}/{len(people)}] {label} -- {e}")
