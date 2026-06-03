@@ -12,7 +12,6 @@ import time
 import re
 import csv
 import io
-from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────
 ST_BASE_URL = "https://api.solidarity.tech/v1"
@@ -119,16 +118,19 @@ def upload_person(api_key, person):
         "last_name": person["last"],
         "email": person["email"],
         "tags": person.get("tags", ["email-list-signup"]),
-        "chapter_id": CHAPTER_ID,
     }
     if person.get("address"):
         user_data["address"] = person["address"]
     if person.get("phone"):
         user_data["phone_number"] = person["phone"]
+    payload = {
+        "user": user_data,
+        "chapter_id": CHAPTER_ID,
+    }
     resp = requests.post(f"{ST_BASE_URL}/users",
                          headers={"Content-Type": "application/json",
                                   "Authorization": f"Bearer {api_key}"},
-                         json={"user": user_data})
+                         json=payload)
     return resp.status_code, resp.text[:300]
 
 
@@ -219,20 +221,6 @@ def main():
 
         if messages:
             st.markdown("---")
-            time_filter = st.radio("Show messages from:", ["Last week", "Last month", "All time"], horizontal=True)
-
-            if time_filter != "All time":
-                cutoff = datetime.now() - (timedelta(days=7) if time_filter == "Last week" else timedelta(days=30))
-                filtered = []
-                for p in messages:
-                    try:
-                        dt = datetime.strptime(p.get("submitted_on", ""), "%m/%d/%Y %H:%M:%S")
-                        if dt >= cutoff:
-                            filtered.append(p)
-                    except:
-                        filtered.append(p)
-                messages = filtered
-
             st.header(f"Messages ({len(messages)})")
             for p in messages:
                 with st.expander(f"{p['first']} {p['last']} -- {p['email']}" +
