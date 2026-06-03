@@ -127,10 +127,10 @@ def upload_person(api_key, person):
     digits = re.sub(r"\D", "", phone_raw)
     has_phone = False
     if len(digits) == 10:
-        user_data["phone_number"] = digits
+        user_data["phone_number"] = int("1" + digits)
         has_phone = True
     elif len(digits) == 11 and digits[0] == "1":
-        user_data["phone_number"] = digits[1:]
+        user_data["phone_number"] = int(digits)
         has_phone = True
     payload = {"user": user_data, "chapter_id": CHAPTER_ID}
     if not has_phone:
