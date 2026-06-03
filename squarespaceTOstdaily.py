@@ -12,6 +12,7 @@ import time
 import re
 import csv
 import io
+from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────
 ST_BASE_URL = "https://api.solidarity.tech/v1"
@@ -121,8 +122,17 @@ def upload_person(api_key, person):
     }
     if person.get("address"):
         user_data["address"] = person["address"]
-    if person.get("phone"):
-        user_data["phone_number"] = person["phone"]
+    phone_raw = (person.get("phone") or "").strip()
+    if phone_raw:
+        digits = re.sub(r"\D", "", phone_raw)
+        if len(digits) == 10:
+            user_data["phone_number"] = "+1" + digits
+        elif len(digits) == 11 and digits[0] == "1":
+            user_data["phone_number"] = "+" + digits
+        else:
+            user_data["phone_number"] = None
+    else:
+        user_data["phone_number"] = None
     payload = {
         "user": user_data,
         "chapter_id": CHAPTER_ID,
@@ -221,15 +231,33 @@ def main():
 
         if messages:
             st.markdown("---")
+            time_filter = st.radio("Show messages from:", ["Last week", "Last month", "All time"], horizontal=True)
+
+            if time_filter != "All time":
+                cutoff = datetime.now() - (timedelta(days=7) if time_filter == "Last week" else timedelta(days=30))
+                filtered = []
+                for p in messages:
+                    try:
+                        dt = datetime.strptime(p.get("submitted_on", ""), "%m/%d/%Y %H:%M:%S")
+                        if dt >= cutoff:
+                            filtered.append(p)
+                    except:
+                        filtered.append(p)
+                messages = filtered
+
             st.header(f"Messages ({len(messages)})")
             for p in messages:
-                with st.expander(f"{p['first']} {p['last']} -- {p['email']}" +
-                                 (f" -- {p['phone']}" if p.get('phone') else "")):
-                    st.markdown(f"> {p['message']}")
-                    if p.get("address"):
-                        st.caption(p["address"])
-                    if p.get("tags"):
-                        st.caption(", ".join(p["tags"]))
+                st.subheader(f"{p['first']} {p['last']} -- {p['email']}" +
+                             (f" -- {p['phone']}" if p.get('phone') else ""))
+                st.markdown(f"> {p['message']}")
+                details = []
+                if p.get("address"):
+                    details.append(p["address"])
+                if p.get("tags"):
+                    details.append(", ".join(p["tags"]))
+                if details:
+                    st.caption(" | ".join(details))
+                st.markdown("---")
 
 
 if __name__ == "__main__":
