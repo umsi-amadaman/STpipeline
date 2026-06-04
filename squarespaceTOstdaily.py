@@ -115,25 +115,22 @@ def dedupe(all_people):
 
 
 def upload_person(api_key, person):
-    user_data = {
+    payload = {
         "first_name": person["first"],
         "last_name": person["last"],
         "email": person["email"],
         "tags": person.get("tags", ["email-list-signup"]),
+        "chapter_id": CHAPTER_ID,
     }
     if person.get("address"):
-        user_data["address"] = person["address"]
+        payload["address"] = person["address"]
     phone_raw = (person.get("phone") or "").strip()
     digits = re.sub(r"\D", "", phone_raw)
-    has_phone = False
     if len(digits) == 10:
-        user_data["phone_number"] = int("1" + digits)
-        has_phone = True
+        payload["phone_number"] = "1" + digits
     elif len(digits) == 11 and digits[0] == "1":
-        user_data["phone_number"] = int(digits)
-        has_phone = True
-    payload = {"user": user_data, "chapter_id": CHAPTER_ID}
-    if not has_phone:
+        payload["phone_number"] = digits
+    if "phone_number" not in payload:
         payload["require_contact_info"] = False
     resp = requests.post(f"{ST_BASE_URL}/users",
                          headers={"Content-Type": "application/json",
